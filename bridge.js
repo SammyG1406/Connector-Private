@@ -12,6 +12,7 @@
 //   {type:"result", ok:true|false, detail:"..."}
 //   {type:"error", message:"..."}
 
+require("dotenv").config();
 const { WebSocketServer } = require("ws");
 const { spawn } = require("child_process");
 const path = require("path");
