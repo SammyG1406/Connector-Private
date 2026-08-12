@@ -14,8 +14,11 @@
 
 require("dotenv").config();
 const { WebSocketServer } = require("ws");
-const { spawn } = require("child_process");
+const spawn = require("cross-spawn");
 const path = require("path");
+
+process.on("uncaughtException", (e) => console.error("[uncaught]", e));
+process.on("unhandledRejection", (e) => console.error("[unhandled rejection]", e));
 
 const PORT = Number(process.env.PORT || 8787);
 const AUTH_TOKEN = process.env.AUTH_TOKEN;
@@ -40,6 +43,7 @@ function runGit(repo, args) {
     let stderr = "";
     proc.stdout.on("data", (d) => (stdout += d));
     proc.stderr.on("data", (d) => (stderr += d));
+    proc.on("error", reject);
     proc.on("close", (code) => {
       if (code === 0) resolve(stdout);
       else reject(new Error(stderr || `git ${args.join(" ")} exited ${code}`));
@@ -124,8 +128,16 @@ wss.on("connection", (ws, req) => {
       claudeProc.stderr.on("data", (d) => {
         send(ws, { type: "log", chunk: d.toString() });
       });
+      let spawnFailed = false;
+      claudeProc.on("error", (e) => {
+        spawnFailed = true;
+        send(ws, { type: "error", message: `failed to start claude: ${e.message}` });
+        pending = null;
+        send(ws, { type: "status", state: "idle" });
+      });
 
       claudeProc.on("close", async (code) => {
+        if (spawnFailed) return;
         if (code !== 0) {
           send(ws, { type: "error", message: `claude exited with code ${code}` });
           pending = null;
