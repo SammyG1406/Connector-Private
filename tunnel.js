@@ -1,15 +1,12 @@
 require("dotenv").config();
 const spawn = require("cross-spawn");
+const { ensureTunnel } = require("./devtunnel-util");
 
 const PORT = process.env.PORT || 8787;
-const NGROK_DOMAIN = process.env.NGROK_DOMAIN;
+const TUNNEL_ID = process.env.DEVTUNNEL_ID || "connector-bridge";
 
-if (!NGROK_DOMAIN) {
-  console.error("NGROK_DOMAIN env var is required");
-  process.exit(1);
-}
+const wsUrl = ensureTunnel(TUNNEL_ID, PORT);
+console.log(`Public URL: ${wsUrl}`);
 
-const proc = spawn("ngrok", ["http", String(PORT), "--url", `https://${NGROK_DOMAIN}`], {
-  stdio: "inherit",
-});
+const proc = spawn("devtunnel", ["host", TUNNEL_ID], { stdio: "inherit" });
 proc.on("exit", (code) => process.exit(code ?? 0));
