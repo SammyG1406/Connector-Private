@@ -15,10 +15,35 @@
 require("dotenv").config();
 const { WebSocketServer } = require("ws");
 const spawn = require("cross-spawn");
+const { execSync } = require("child_process");
+const fs = require("fs");
 const path = require("path");
 
 process.on("uncaughtException", (e) => console.error("[uncaught]", e));
 process.on("unhandledRejection", (e) => console.error("[unhandled rejection]", e));
+
+// On Windows, "claude" resolves to claude.cmd, a shim that cross-spawn can only
+// invoke via cmd.exe — which mangles flags like --dangerously-skip-permissions
+// in practice. Resolve straight to the real claude.exe to skip that layer.
+function resolveClaudeCommand() {
+  if (process.platform !== "win32") return "claude";
+  try {
+    const cmdPath = execSync("where claude.cmd", { encoding: "utf8" }).split(/\r?\n/)[0].trim();
+    const exePath = path.join(
+      path.dirname(cmdPath),
+      "node_modules",
+      "@anthropic-ai",
+      "claude-code",
+      "bin",
+      "claude.exe"
+    );
+    if (fs.existsSync(exePath)) return exePath;
+  } catch {
+    // fall through
+  }
+  return "claude";
+}
+const CLAUDE_CMD = resolveClaudeCommand();
 
 const PORT = Number(process.env.PORT || 8787);
 const AUTH_TOKEN = process.env.AUTH_TOKEN;
@@ -115,11 +140,9 @@ wss.on("connection", (ws, req) => {
         `Make the necessary code changes in this repo. Do NOT run 'git commit' or 'git push' ` +
         `yourself — stop once the changes are made on disk.`;
 
-      const claudeProc = spawn(
-        "claude",
-        ["-p", prompt, "--dangerously-skip-permissions", "--output-format", "stream-json"],
-        { cwd: repo }
-      );
+      const claudeProc = spawn(CLAUDE_CMD, ["-p", prompt, "--dangerously-skip-permissions"], {
+        cwd: repo,
+      });
       pending = { repo, claudeProc };
 
       claudeProc.stdout.on("data", (d) => {
