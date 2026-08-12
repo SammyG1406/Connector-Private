@@ -4,7 +4,9 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "bridge": "node bridge.js",
+    "tunnel": "ngrok http 8787 --domain=ideology-filth-recliner.ngrok-free.dev"
   },
   "repository": {
     "type": "git",
