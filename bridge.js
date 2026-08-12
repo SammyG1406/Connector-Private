@@ -12,7 +12,7 @@
 //   {type:"result", ok:true|false, detail:"..."}
 //   {type:"error", message:"..."}
 
-require("dotenv").config();
+require("dotenv").config({ quiet: true });
 const { WebSocketServer } = require("ws");
 const spawn = require("cross-spawn");
 const { execSync } = require("child_process");

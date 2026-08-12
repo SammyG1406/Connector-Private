@@ -1,4 +1,4 @@
-require("dotenv").config();
+require("dotenv").config({ quiet: true });
 const spawn = require("cross-spawn");
 const { ensureTunnel } = require("./devtunnel-util");
 
