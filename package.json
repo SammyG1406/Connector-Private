@@ -6,7 +6,8 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "bridge": "node bridge.js",
-    "tunnel": "ngrok http 8787 --domain=ideology-filth-recliner.ngrok-free.dev",
+    "tunnel": "node tunnel.js",
+    "qr": "node qr.js",
     "dev": "concurrently -n bridge,tunnel -c blue,green \"npm run bridge\" \"npm run tunnel\""
   },
   "repository": {
@@ -24,6 +25,7 @@
   "dependencies": {
     "cross-spawn": "^7.0.6",
     "dotenv": "^17.4.2",
+    "qrcode": "^1.5.4",
     "ws": "^8.21.3"
   },
   "devDependencies": {
