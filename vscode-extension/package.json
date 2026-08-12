@@ -1,0 +1,38 @@
+{
+  "name": "connector-bridge-control",
+  "displayName": "Connector Bridge Control",
+  "description": "One-click start/stop and QR pairing for the phone-to-repo bridge",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "connectorBridge.start",
+        "title": "Connector Bridge: Start"
+      },
+      {
+        "command": "connectorBridge.stop",
+        "title": "Connector Bridge: Stop"
+      },
+      {
+        "command": "connectorBridge.showQR",
+        "title": "Connector Bridge: Show QR Code"
+      }
+    ],
+    "configuration": {
+      "title": "Connector Bridge",
+      "properties": {
+        "connectorBridge.projectPath": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute path to the bridge project (the folder containing bridge.js). Defaults to the first workspace folder if unset."
+        }
+      }
+    }
+  }
+}
