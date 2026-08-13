@@ -55,8 +55,7 @@ function showQRPanel(data) {
   <img src="${data.dataUrl}" width="280" height="280" style="image-rendering: pixelated; background: white; padding: 12px; border-radius: 8px;" />
   <p><b>ws:</b> ${escapeHtml(data.ws)}</p>
   <p><b>repo:</b> ${escapeHtml(data.repo)}</p>
-  <p><b>token:</b> ${escapeHtml(data.token)}</p>
-  <p style="opacity: 0.7; font-size: 0.9em;">Scan with the bridge app, or enter these fields manually.</p>
+  <p style="opacity: 0.7; font-size: 0.9em;">Scan with the bridge app, or enter these fields manually. No secret is encoded — the app authorizes via its own GitHub login.</p>
 </body>
 </html>`;
 }

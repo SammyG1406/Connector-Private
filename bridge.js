@@ -1,5 +1,9 @@
 // Bridge: phone <-> WebSocket <-> Claude Code (headless) <-> git
 //
+// Connect with ?githubToken=<GitHub OAuth token>. Authorization isn't a
+// shared secret — each instruction is checked against GitHub's own
+// collaborator-permission API for the target repo (write/admin required).
+//
 // Protocol (client -> server):
 //   {type:"instruction", repo:"/abs/path", text:"..."}
 //   {type:"approve", message:"commit message"}
@@ -46,19 +50,81 @@ function resolveClaudeCommand() {
 const CLAUDE_CMD = resolveClaudeCommand();
 
 const PORT = Number(process.env.PORT || 8787);
-const AUTH_TOKEN = process.env.AUTH_TOKEN;
 const ALLOWED_REPOS = (process.env.ALLOWED_REPOS || "")
   .split(",")
   .map((p) => p && path.resolve(p))
   .filter(Boolean);
 
-if (!AUTH_TOKEN) {
-  console.error("AUTH_TOKEN env var is required");
-  process.exit(1);
-}
 if (ALLOWED_REPOS.length === 0) {
   console.error("ALLOWED_REPOS env var is required (comma-separated absolute paths)");
   process.exit(1);
+}
+
+// Parses "https://github.com/owner/repo.git" or "git@github.com:owner/repo.git"
+function parseGithubRemote(remoteUrl) {
+  const m = remoteUrl.trim().match(/github\.com[/:]([^/]+)\/(.+?)(\.git)?$/);
+  if (!m) return null;
+  return { owner: m[1], repo: m[2] };
+}
+
+// Authorization is delegated to GitHub itself: the presented token must belong
+// to an account with write (or admin) access to the specific repo being
+// targeted. This replaces a shared bearer secret with a real identity check —
+// a leaked QR code is useless without a GitHub account GitHub itself vouches
+// for on this repo.
+async function checkGithubPermission(githubToken, repoPath) {
+  let remoteUrl;
+  try {
+    remoteUrl = (await runGit(repoPath, ["remote", "get-url", "origin"])).trim();
+  } catch (e) {
+    return { ok: false, reason: `could not read git remote: ${e.message}` };
+  }
+
+  const parsed = parseGithubRemote(remoteUrl);
+  if (!parsed) {
+    return { ok: false, reason: `remote "${remoteUrl}" is not a recognizable GitHub URL` };
+  }
+
+  const headers = {
+    Authorization: `Bearer ${githubToken}`,
+    "User-Agent": "connector-bridge",
+    Accept: "application/vnd.github+json",
+  };
+
+  let userRes;
+  try {
+    userRes = await fetch("https://api.github.com/user", { headers });
+  } catch (e) {
+    return { ok: false, reason: `could not reach GitHub: ${e.message}` };
+  }
+  if (!userRes.ok) {
+    return { ok: false, reason: `GitHub token invalid or expired (status ${userRes.status})` };
+  }
+  const user = await userRes.json();
+
+  let permRes;
+  try {
+    permRes = await fetch(
+      `https://api.github.com/repos/${parsed.owner}/${parsed.repo}/collaborators/${user.login}/permission`,
+      { headers }
+    );
+  } catch (e) {
+    return { ok: false, reason: `could not reach GitHub: ${e.message}` };
+  }
+  if (!permRes.ok) {
+    return {
+      ok: false,
+      reason: `could not check ${user.login}'s access to ${parsed.owner}/${parsed.repo} (status ${permRes.status})`,
+    };
+  }
+  const { permission } = await permRes.json();
+  if (permission === "admin" || permission === "write") {
+    return { ok: true, username: user.login };
+  }
+  return {
+    ok: false,
+    reason: `${user.login} has "${permission}" access to ${parsed.owner}/${parsed.repo}; write access required`,
+  };
 }
 
 function runGit(repo, args) {
@@ -90,9 +156,9 @@ console.log(`Bridge listening on ws://localhost:${PORT}`);
 
 wss.on("connection", (ws, req) => {
   const url = new URL(req.url, "http://localhost");
-  const token = url.searchParams.get("token");
-  if (token !== AUTH_TOKEN) {
-    ws.close(4001, "unauthorized");
+  const githubToken = url.searchParams.get("githubToken");
+  if (!githubToken) {
+    ws.close(4001, "missing githubToken");
     return;
   }
 
@@ -117,6 +183,12 @@ wss.on("connection", (ws, req) => {
       const repo = path.resolve(msg.repo || "");
       if (!ALLOWED_REPOS.includes(repo)) {
         send(ws, { type: "error", message: `repo not allowlisted: ${repo}` });
+        return;
+      }
+
+      const permCheck = await checkGithubPermission(githubToken, repo);
+      if (!permCheck.ok) {
+        send(ws, { type: "error", message: `not authorized: ${permCheck.reason}` });
         return;
       }
 
