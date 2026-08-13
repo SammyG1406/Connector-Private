@@ -1,0 +1,19 @@
+services:
+  food-service:
+    build: ./food-service
+    ports:
+      - "4001:4001"
+    environment:
+      - PORT=4001
+
+  meal-service:
+    build: ./meal-service
+    ports:
+      - "4002:4002"
+    environment:
+      - PORT=4002
+
+  food-fastapi-service:
+    build: ./food-fastapi-service
+    ports:
+      - "8000:8000"
