@@ -222,9 +222,11 @@ wss.on("connection", (ws, req) => {
         `Make the necessary code changes in this repo. Do NOT run 'git commit' or 'git push' ` +
         `yourself — stop once the changes are made on disk.`;
 
-      const claudeProc = spawn(CLAUDE_CMD, ["-p", prompt, "--dangerously-skip-permissions"], {
-        cwd: repo,
-      });
+      const claudeProc = spawn(
+        CLAUDE_CMD,
+        ["-p", prompt, "--dangerously-skip-permissions", "--continue"],
+        { cwd: repo }
+      );
       pending = { repo, claudeProc };
 
       claudeProc.stdout.on("data", (d) => {
