@@ -73,6 +73,10 @@ function parseGithubRemote(remoteUrl) {
 // a leaked QR code is useless without a GitHub account GitHub itself vouches
 // for on this repo.
 async function checkGithubPermission(githubToken, repoPath) {
+  if (!fs.existsSync(repoPath)) {
+    return { ok: false, reason: `repo folder no longer exists on disk: ${repoPath}` };
+  }
+
   let remoteUrl;
   try {
     remoteUrl = (await runGit(repoPath, ["remote", "get-url", "origin"])).trim();
@@ -112,6 +116,12 @@ async function checkGithubPermission(githubToken, repoPath) {
     return { ok: false, reason: `could not reach GitHub: ${e.message}` };
   }
   if (!permRes.ok) {
+    if (permRes.status === 404) {
+      return {
+        ok: false,
+        reason: `${parsed.owner}/${parsed.repo} not found on GitHub — it may have been deleted, renamed, or made inaccessible to this account`,
+      };
+    }
     return {
       ok: false,
       reason: `could not check ${user.login}'s access to ${parsed.owner}/${parsed.repo} (status ${permRes.status})`,
@@ -267,10 +277,29 @@ wss.on("connection", (ws, req) => {
         return;
       }
       const { repo } = pending;
+
+      // Re-check rather than trust the check from instruction-time: access
+      // can be revoked, or the repo deleted, while a diff sits awaiting review.
+      const permCheck = await checkGithubPermission(githubToken, repo);
+      if (!permCheck.ok) {
+        send(ws, { type: "error", message: `not authorized: ${permCheck.reason}` });
+        pending = null;
+        send(ws, { type: "status", state: "idle" });
+        return;
+      }
+
       try {
         await runGit(repo, ["commit", "-m", msg.message || "Changes via bridge"]);
-        await runGit(repo, ["push"]);
-        send(ws, { type: "result", ok: true, detail: "committed and pushed" });
+        try {
+          await runGit(repo, ["push"]);
+          send(ws, { type: "result", ok: true, detail: "committed and pushed" });
+        } catch (pushErr) {
+          send(ws, {
+            type: "result",
+            ok: false,
+            detail: `committed locally but push failed (a local commit now exists, unpushed): ${pushErr.message}`,
+          });
+        }
       } catch (e) {
         send(ws, { type: "result", ok: false, detail: e.message });
       } finally {
@@ -286,6 +315,16 @@ wss.on("connection", (ws, req) => {
         return;
       }
       const { repo } = pending;
+      if (!fs.existsSync(repo)) {
+        send(ws, {
+          type: "result",
+          ok: false,
+          detail: `repo folder no longer exists on disk: ${repo}`,
+        });
+        pending = null;
+        send(ws, { type: "status", state: "idle" });
+        return;
+      }
       try {
         await runGit(repo, ["reset", "--hard", "HEAD"]);
         await runGit(repo, ["clean", "-fd"]);
