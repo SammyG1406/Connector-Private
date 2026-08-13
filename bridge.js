@@ -4,17 +4,23 @@
 // shared secret — each instruction is checked against GitHub's own
 // collaborator-permission API for the target repo (write/admin required).
 //
-// Protocol (client -> server):
+// Controller protocol (client -> server):
 //   {type:"instruction", repo:"/abs/path", text:"..."}
 //   {type:"approve", message:"commit message"}
 //   {type:"reject"}
 //
-// Protocol (server -> client):
+// Server -> client (both controllers and observers receive these):
 //   {type:"status", state:"..."}
 //   {type:"log", chunk:"..."}
 //   {type:"diff", diff:"..."}
 //   {type:"result", ok:true|false, detail:"..."}
 //   {type:"error", message:"..."}
+//
+// Observer mode: connect with ?observer=true&repo=/abs/path (in addition to
+// githubToken). Read-only — requires only read access to the repo, not
+// write — and receives the same status/log/diff/result stream a controller
+// working on that repo sees, without being able to send instructions or
+// approve/reject.
 
 require("dotenv").config({ quiet: true });
 const { WebSocketServer } = require("ws");
@@ -72,7 +78,9 @@ function parseGithubRemote(remoteUrl) {
 // targeted. This replaces a shared bearer secret with a real identity check —
 // a leaked QR code is useless without a GitHub account GitHub itself vouches
 // for on this repo.
-async function checkGithubPermission(githubToken, repoPath) {
+const PERMISSION_RANK = { none: 0, read: 1, write: 2, admin: 3 };
+
+async function checkGithubPermission(githubToken, repoPath, minPermission = "write") {
   if (!fs.existsSync(repoPath)) {
     return { ok: false, reason: `repo folder no longer exists on disk: ${repoPath}` };
   }
@@ -128,12 +136,12 @@ async function checkGithubPermission(githubToken, repoPath) {
     };
   }
   const { permission } = await permRes.json();
-  if (permission === "admin" || permission === "write") {
+  if ((PERMISSION_RANK[permission] ?? 0) >= PERMISSION_RANK[minPermission]) {
     return { ok: true, username: user.login };
   }
   return {
     ok: false,
-    reason: `${user.login} has "${permission}" access to ${parsed.owner}/${parsed.repo}; write access required`,
+    reason: `${user.login} has "${permission}" access to ${parsed.owner}/${parsed.repo}; ${minPermission} access required`,
   };
 }
 
@@ -161,6 +169,34 @@ function send(ws, msg) {
   if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(msg));
 }
 
+// repo path -> Set<ws> of read-only observers watching that repo's activity.
+const observers = new Map();
+
+function addObserver(repo, ws) {
+  if (!observers.has(repo)) observers.set(repo, new Set());
+  observers.get(repo).add(ws);
+}
+
+function removeObserver(repo, ws) {
+  const set = observers.get(repo);
+  if (!set) return;
+  set.delete(ws);
+  if (set.size === 0) observers.delete(repo);
+}
+
+// Sends to the controlling connection and mirrors the same message to every
+// observer registered for that repo, so a live-watching connection sees
+// exactly what the controller sees.
+function broadcast(repo, msg, originWs) {
+  send(originWs, msg);
+  const set = observers.get(repo);
+  if (!set) return;
+  const payload = JSON.stringify(msg);
+  for (const obs of set) {
+    if (obs !== originWs && obs.readyState === obs.OPEN) obs.send(payload);
+  }
+}
+
 const wss = new WebSocketServer({ port: PORT });
 console.log(`Bridge listening on ws://localhost:${PORT}`);
 
@@ -169,6 +205,26 @@ wss.on("connection", (ws, req) => {
   const githubToken = url.searchParams.get("githubToken");
   if (!githubToken) {
     ws.close(4001, "missing githubToken");
+    return;
+  }
+
+  // Observers are read-only: they watch one repo's activity stream but can't
+  // send instructions or approve/reject. Requires only read access, not write.
+  if (url.searchParams.get("observer") === "true") {
+    const repo = path.resolve(url.searchParams.get("repo") || "");
+    if (!ALLOWED_REPOS.includes(repo)) {
+      ws.close(4003, "repo not allowlisted");
+      return;
+    }
+    checkGithubPermission(githubToken, repo, "read").then((check) => {
+      if (!check.ok) {
+        ws.close(4003, `not authorized: ${check.reason}`);
+        return;
+      }
+      addObserver(repo, ws);
+      send(ws, { type: "status", state: "observing" });
+      ws.on("close", () => removeObserver(repo, ws));
+    });
     return;
   }
 
@@ -215,7 +271,7 @@ wss.on("connection", (ws, req) => {
         return;
       }
 
-      send(ws, { type: "status", state: "running" });
+      broadcast(repo, { type: "status", state: "running" }, ws);
 
       const prompt =
         `${msg.text}\n\n` +
@@ -230,44 +286,44 @@ wss.on("connection", (ws, req) => {
       pending = { repo, claudeProc };
 
       claudeProc.stdout.on("data", (d) => {
-        send(ws, { type: "log", chunk: d.toString() });
+        broadcast(repo, { type: "log", chunk: d.toString() }, ws);
       });
       claudeProc.stderr.on("data", (d) => {
-        send(ws, { type: "log", chunk: d.toString() });
+        broadcast(repo, { type: "log", chunk: d.toString() }, ws);
       });
       let spawnFailed = false;
       claudeProc.on("error", (e) => {
         spawnFailed = true;
-        send(ws, { type: "error", message: `failed to start claude: ${e.message}` });
+        broadcast(repo, { type: "error", message: `failed to start claude: ${e.message}` }, ws);
         pending = null;
-        send(ws, { type: "status", state: "idle" });
+        broadcast(repo, { type: "status", state: "idle" }, ws);
       });
 
       claudeProc.on("close", async (code) => {
         if (spawnFailed) return;
         if (code !== 0) {
-          send(ws, { type: "error", message: `claude exited with code ${code}` });
+          broadcast(repo, { type: "error", message: `claude exited with code ${code}` }, ws);
           pending = null;
-          send(ws, { type: "status", state: "idle" });
+          broadcast(repo, { type: "status", state: "idle" }, ws);
           return;
         }
 
         try {
           const clean = await isTreeClean(repo);
           if (clean) {
-            send(ws, { type: "status", state: "no_changes" });
+            broadcast(repo, { type: "status", state: "no_changes" }, ws);
             pending = null;
             return;
           }
 
           await runGit(repo, ["add", "-A"]);
           const diff = await runGit(repo, ["diff", "--cached"]);
-          send(ws, { type: "diff", diff });
-          send(ws, { type: "status", state: "awaiting_approval" });
+          broadcast(repo, { type: "diff", diff }, ws);
+          broadcast(repo, { type: "status", state: "awaiting_approval" }, ws);
         } catch (e) {
-          send(ws, { type: "error", message: `post-run git failed: ${e.message}` });
+          broadcast(repo, { type: "error", message: `post-run git failed: ${e.message}` }, ws);
           pending = null;
-          send(ws, { type: "status", state: "idle" });
+          broadcast(repo, { type: "status", state: "idle" }, ws);
         }
       });
       return;
@@ -284,9 +340,9 @@ wss.on("connection", (ws, req) => {
       // can be revoked, or the repo deleted, while a diff sits awaiting review.
       const permCheck = await checkGithubPermission(githubToken, repo);
       if (!permCheck.ok) {
-        send(ws, { type: "error", message: `not authorized: ${permCheck.reason}` });
+        broadcast(repo, { type: "error", message: `not authorized: ${permCheck.reason}` }, ws);
         pending = null;
-        send(ws, { type: "status", state: "idle" });
+        broadcast(repo, { type: "status", state: "idle" }, ws);
         return;
       }
 
@@ -294,19 +350,23 @@ wss.on("connection", (ws, req) => {
         await runGit(repo, ["commit", "-m", msg.message || "Changes via bridge"]);
         try {
           await runGit(repo, ["push"]);
-          send(ws, { type: "result", ok: true, detail: "committed and pushed" });
+          broadcast(repo, { type: "result", ok: true, detail: "committed and pushed" }, ws);
         } catch (pushErr) {
-          send(ws, {
-            type: "result",
-            ok: false,
-            detail: `committed locally but push failed (a local commit now exists, unpushed): ${pushErr.message}`,
-          });
+          broadcast(
+            repo,
+            {
+              type: "result",
+              ok: false,
+              detail: `committed locally but push failed (a local commit now exists, unpushed): ${pushErr.message}`,
+            },
+            ws
+          );
         }
       } catch (e) {
-        send(ws, { type: "result", ok: false, detail: e.message });
+        broadcast(repo, { type: "result", ok: false, detail: e.message }, ws);
       } finally {
         pending = null;
-        send(ws, { type: "status", state: "idle" });
+        broadcast(repo, { type: "status", state: "idle" }, ws);
       }
       return;
     }
@@ -318,24 +378,24 @@ wss.on("connection", (ws, req) => {
       }
       const { repo } = pending;
       if (!fs.existsSync(repo)) {
-        send(ws, {
-          type: "result",
-          ok: false,
-          detail: `repo folder no longer exists on disk: ${repo}`,
-        });
+        broadcast(
+          repo,
+          { type: "result", ok: false, detail: `repo folder no longer exists on disk: ${repo}` },
+          ws
+        );
         pending = null;
-        send(ws, { type: "status", state: "idle" });
+        broadcast(repo, { type: "status", state: "idle" }, ws);
         return;
       }
       try {
         await runGit(repo, ["reset", "--hard", "HEAD"]);
         await runGit(repo, ["clean", "-fd"]);
-        send(ws, { type: "result", ok: true, detail: "discarded" });
+        broadcast(repo, { type: "result", ok: true, detail: "discarded" }, ws);
       } catch (e) {
-        send(ws, { type: "result", ok: false, detail: e.message });
+        broadcast(repo, { type: "result", ok: false, detail: e.message }, ws);
       } finally {
         pending = null;
-        send(ws, { type: "status", state: "idle" });
+        broadcast(repo, { type: "status", state: "idle" }, ws);
       }
       return;
     }
