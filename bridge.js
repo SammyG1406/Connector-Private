@@ -1,8 +1,13 @@
-// Bridge: phone <-> WebSocket <-> Claude Code (headless) <-> git
+// Bridge: phone <-> WebSocket <-> agent CLI (headless) <-> git
 //
 // Connect with ?githubToken=<GitHub OAuth token>. Authorization isn't a
 // shared secret — each instruction is checked against GitHub's own
 // collaborator-permission API for the target repo (write/admin required).
+//
+// Which agent CLI runs instructions is auto-detected at startup: tries
+// claude, copilot, codex (in that order, see AGENT_PRIORITY) and uses
+// whichever is actually installed. Override entirely with AGENT_CMD (plus
+// optional AGENT_ARGS, a template using {prompt}) to point at anything else.
 //
 // Controller protocol (client -> server):
 //   {type:"instruction", repo:"/abs/path", text:"..."}
@@ -32,30 +37,150 @@ const path = require("path");
 process.on("uncaughtException", (e) => console.error("[uncaught]", e));
 process.on("unhandledRejection", (e) => console.error("[unhandled rejection]", e));
 
-// On Windows, "claude" resolves to claude.cmd, a shim that cross-spawn can only
-// invoke via cmd.exe — which mangles flags like --dangerously-skip-permissions
-// in practice. Resolve straight to the real claude.exe to skip that layer.
-function resolveClaudeCommand() {
-  if (process.platform !== "win32") return "claude";
+// On Windows, npm-installed CLIs resolve to a .cmd shim that cross-spawn can
+// only invoke via cmd.exe — which has repeatedly mangled flags like
+// --dangerously-skip-permissions in practice. Rather than hardcode each
+// tool's install layout, parse the shim's own script to find what it
+// actually invokes (a direct .exe, or node + a .js entry point) and spawn
+// that directly, skipping cmd.exe entirely. Verified against both shapes:
+// claude.cmd (direct .exe) and codex.cmd/copilot.cmd (node + .js).
+function resolveWindowsShim(toolName) {
+  let cmdPath;
   try {
-    const cmdPath = execSync("where claude.cmd", { encoding: "utf8" }).split(/\r?\n/)[0].trim();
-    const exePath = path.join(
-      path.dirname(cmdPath),
-      "node_modules",
-      "@anthropic-ai",
-      "claude-code",
-      "bin",
-      "claude.exe"
-    );
-    if (fs.existsSync(exePath)) return exePath;
+    cmdPath = execSync(`where ${toolName}.cmd`, { encoding: "utf8" }).split(/\r?\n/)[0].trim();
   } catch {
-    // fall through
+    return null;
   }
-  return "claude";
+  if (!cmdPath || !fs.existsSync(cmdPath)) return null;
+
+  const content = fs.readFileSync(cmdPath, "utf8");
+  const dp0 = path.dirname(cmdPath) + path.sep;
+  const resolveDp0 = (s) => s.replace(/%dp0%/gi, dp0);
+
+  let m = content.match(/"([^"]+\.exe)"\s*%\*/i);
+  if (m) {
+    const exePath = path.normalize(resolveDp0(m[1]));
+    return fs.existsSync(exePath) ? { cmd: exePath, prefixArgs: [] } : null;
+  }
+
+  m = content.match(/"([^"]+\.js)"\s*%\*/i);
+  if (m) {
+    const script = path.normalize(resolveDp0(m[1]));
+    if (!fs.existsSync(script)) return null;
+    const localNode = path.join(dp0, "node.exe");
+    const node = fs.existsSync(localNode) ? localNode : "node";
+    return { cmd: node, prefixArgs: [script] };
+  }
+  return null;
 }
-const CLAUDE_CMD = resolveClaudeCommand();
+
+function resolveAgentCommand(toolName) {
+  if (process.platform === "win32") {
+    const resolved = resolveWindowsShim(toolName);
+    if (resolved) return resolved;
+  }
+  return { cmd: toolName, prefixArgs: [] };
+}
+
+function checkCommandAvailable(cmd, args) {
+  return new Promise((resolve) => {
+    const proc = spawn(cmd, args, {});
+    let failed = false;
+    proc.on("error", () => {
+      failed = true;
+      resolve(false);
+    });
+    proc.on("close", (code) => {
+      if (!failed) resolve(code === 0);
+    });
+  });
+}
+
+// Known agent CLIs, tried in priority order (AGENT_PRIORITY) at startup —
+// first one that's actually installed wins. Each buildArgs(prompt) returns
+// the args for a fresh, non-interactive, no-confirmation-prompts run.
+// Flags verified directly against each tool's --help, not guessed.
+const KNOWN_AGENTS = {
+  claude: {
+    cmd: "claude",
+    versionArgs: ["--version"],
+    buildArgs: (prompt) => ["-p", prompt, "--dangerously-skip-permissions", "--continue"],
+  },
+  copilot: {
+    cmd: "copilot",
+    versionArgs: ["--version"],
+    buildArgs: (prompt) => ["-p", prompt, "--allow-all-tools", "--continue"],
+  },
+  codex: {
+    cmd: "codex",
+    versionArgs: ["--version"],
+    buildArgs: (prompt) => ["exec", prompt, "--dangerously-bypass-approvals-and-sandbox"],
+  },
+};
+
+const AGENT_CMD_OVERRIDE = process.env.AGENT_CMD;
+const AGENT_ARGS_OVERRIDE = process.env.AGENT_ARGS; // template string, {prompt} placeholder
+const AGENT_PRIORITY = (process.env.AGENT_PRIORITY || "claude,copilot,codex")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+let SELECTED_AGENT = null; // { label, cmd, prefixArgs, buildArgs }
+
+async function selectAgent() {
+  if (AGENT_CMD_OVERRIDE) {
+    const template = AGENT_ARGS_OVERRIDE || "-p {prompt} --dangerously-skip-permissions";
+    const resolved = resolveAgentCommand(AGENT_CMD_OVERRIDE);
+    const buildArgs = (prompt) => [
+      ...resolved.prefixArgs,
+      ...template.split(" ").map((tok) => (tok === "{prompt}" ? prompt : tok)),
+    ];
+    const ok = await checkCommandAvailable(resolved.cmd, [...resolved.prefixArgs, "--version"]);
+    if (!ok) {
+      console.error(
+        `[agent] AGENT_CMD="${AGENT_CMD_OVERRIDE}" does not appear to be usable ` +
+          `(checked --version). Instructions will fail until this is fixed.`
+      );
+    } else {
+      console.log(`[agent] using "${AGENT_CMD_OVERRIDE}" (from AGENT_CMD)`);
+    }
+    SELECTED_AGENT = { label: AGENT_CMD_OVERRIDE, cmd: resolved.cmd, buildArgs };
+    return;
+  }
+
+  for (const name of AGENT_PRIORITY) {
+    const known = KNOWN_AGENTS[name];
+    if (!known) continue;
+    const resolved = resolveAgentCommand(known.cmd);
+    const ok = await checkCommandAvailable(resolved.cmd, [
+      ...resolved.prefixArgs,
+      ...known.versionArgs,
+    ]);
+    if (ok) {
+      SELECTED_AGENT = {
+        label: name,
+        cmd: resolved.cmd,
+        buildArgs: (prompt) => [...resolved.prefixArgs, ...known.buildArgs(prompt)],
+      };
+      console.log(`[agent] using "${name}"`);
+      return;
+    }
+  }
+
+  console.error(
+    `[agent] none of the known tools (${AGENT_PRIORITY.join(", ")}) were found. ` +
+      `Set AGENT_CMD in .env to point at whichever CLI you have installed. ` +
+      `Instructions will fail with a clear error until this is fixed.`
+  );
+}
 
 const PORT = Number(process.env.PORT || 8787);
+// Some agent CLIs block on an interactive prompt (e.g. a first-run login)
+// instead of failing fast when misconfigured — observed directly with an
+// unauthenticated copilot session. Without a timeout that hangs a "running"
+// session forever with no feedback. 10 minutes is generous for a real task
+// while still bounding a truly stuck process.
+const AGENT_TIMEOUT_MS = Number(process.env.AGENT_TIMEOUT_MS || 10 * 60 * 1000);
 const ALLOWED_REPOS = (process.env.ALLOWED_REPOS || "")
   .split(",")
   .map((p) => p && path.resolve(p))
@@ -197,10 +322,13 @@ function broadcast(repo, msg, originWs) {
   }
 }
 
-const wss = new WebSocketServer({ port: PORT });
-console.log(`Bridge listening on ws://localhost:${PORT}`);
+async function main() {
+  await selectAgent();
 
-wss.on("connection", (ws, req) => {
+  const wss = new WebSocketServer({ port: PORT });
+  console.log(`Bridge listening on ws://localhost:${PORT}`);
+
+  wss.on("connection", (ws, req) => {
   const url = new URL(req.url, "http://localhost");
   const githubToken = url.searchParams.get("githubToken");
   if (!githubToken) {
@@ -229,7 +357,7 @@ wss.on("connection", (ws, req) => {
   }
 
   // Per-connection state: only one pending change-set at a time.
-  let pending = null; // { repo, claudeProc }
+  let pending = null; // { repo, agentProc }
 
   ws.on("message", async (raw) => {
     let msg;
@@ -271,6 +399,14 @@ wss.on("connection", (ws, req) => {
         return;
       }
 
+      if (!SELECTED_AGENT) {
+        send(ws, {
+          type: "error",
+          message: "no usable agent CLI found on this machine; set AGENT_CMD in .env",
+        });
+        return;
+      }
+
       broadcast(repo, { type: "status", state: "running" }, ws);
 
       const prompt =
@@ -278,31 +414,58 @@ wss.on("connection", (ws, req) => {
         `Make the necessary code changes in this repo. Do NOT run 'git commit' or 'git push' ` +
         `yourself — stop once the changes are made on disk.`;
 
-      const claudeProc = spawn(
-        CLAUDE_CMD,
-        ["-p", prompt, "--dangerously-skip-permissions", "--continue"],
-        { cwd: repo }
-      );
-      pending = { repo, claudeProc };
+      const agentProc = spawn(SELECTED_AGENT.cmd, SELECTED_AGENT.buildArgs(prompt), {
+        cwd: repo,
+      });
+      pending = { repo, agentProc };
 
-      claudeProc.stdout.on("data", (d) => {
+      let timedOut = false;
+      const timeoutTimer = setTimeout(() => {
+        timedOut = true;
+        agentProc.kill();
+        broadcast(
+          repo,
+          {
+            type: "error",
+            message: `${SELECTED_AGENT.label} timed out after ${Math.round(
+              AGENT_TIMEOUT_MS / 1000
+            )}s with no result — it may be stuck on an interactive prompt (e.g. a first-run login)`,
+          },
+          ws
+        );
+        pending = null;
+        broadcast(repo, { type: "status", state: "idle" }, ws);
+      }, AGENT_TIMEOUT_MS);
+
+      agentProc.stdout.on("data", (d) => {
         broadcast(repo, { type: "log", chunk: d.toString() }, ws);
       });
-      claudeProc.stderr.on("data", (d) => {
+      agentProc.stderr.on("data", (d) => {
         broadcast(repo, { type: "log", chunk: d.toString() }, ws);
       });
       let spawnFailed = false;
-      claudeProc.on("error", (e) => {
+      agentProc.on("error", (e) => {
+        clearTimeout(timeoutTimer);
+        if (timedOut) return;
         spawnFailed = true;
-        broadcast(repo, { type: "error", message: `failed to start claude: ${e.message}` }, ws);
+        broadcast(
+          repo,
+          { type: "error", message: `failed to start ${SELECTED_AGENT.label}: ${e.message}` },
+          ws
+        );
         pending = null;
         broadcast(repo, { type: "status", state: "idle" }, ws);
       });
 
-      claudeProc.on("close", async (code) => {
-        if (spawnFailed) return;
+      agentProc.on("close", async (code) => {
+        clearTimeout(timeoutTimer);
+        if (spawnFailed || timedOut) return;
         if (code !== 0) {
-          broadcast(repo, { type: "error", message: `claude exited with code ${code}` }, ws);
+          broadcast(
+            repo,
+            { type: "error", message: `${SELECTED_AGENT.label} exited with code ${code}` },
+            ws
+          );
           pending = null;
           broadcast(repo, { type: "status", state: "idle" }, ws);
           return;
@@ -404,7 +567,10 @@ wss.on("connection", (ws, req) => {
   });
 
   ws.on("close", () => {
-    // Note: an in-flight claude process for this connection keeps running
+    // Note: an in-flight agent process for this connection keeps running
     // and the change-set is left pending; reconnect and approve/reject it.
   });
-});
+  });
+}
+
+main();
