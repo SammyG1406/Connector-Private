@@ -11,12 +11,19 @@
 //
 // Controller protocol (client -> server):
 //   {type:"instruction", repo:"/abs/path", text:"..."}
+//   {type:"answer", value:"..."}       -- reply to a pending "question" log event
 //   {type:"approve", message:"commit message"}
 //   {type:"reject"}
 //
 // Server -> client (both controllers and observers receive these):
-//   {type:"status", state:"..."}
-//   {type:"log", chunk:"..."}
+//   {type:"status", state:"running"|"awaiting_answer"|"awaiting_approval"|"no_changes"|"idle"|"observing"}
+//   {type:"log", kind:"tool_call"|"message"|"question"|"error"|"done"|"raw", text:"...",
+//                tool:"...", target:"...", options:[...]}
+//     - tool/target only present on kind:"tool_call"; options only on kind:"question"
+//     - kind:"question" means the agent is paused awaiting an {type:"answer"} reply
+//       (see OPTIONS convention in AGENT_PROMPT_SUFFIX below — this is not a
+//       feature any of the three tools have natively; it's a text convention
+//       we impose via the prompt and parse out of their plain-text replies)
 //   {type:"diff", diff:"..."}
 //   {type:"result", ok:true|false, detail:"..."}
 //   {type:"error", message:"..."}
@@ -101,37 +108,70 @@ function truncate(s, n = 150) {
   return s.length > n ? s.slice(0, n - 1) + "…" : s;
 }
 
-// Each summarizer takes one parsed JSONL event from a tool's structured
-// output mode and returns either a short human-readable line (a bullet
-// point, no raw code/diffs) or null to skip it entirely. Built from real
-// event streams captured against actual installs on this machine — not
-// guessed — except where noted.
+// None of claude/copilot/codex have a native "pause and ask the user to pick
+// one of a few options" mechanism in headless mode — verified directly: asked
+// claude an intentionally ambiguous question, and it just answered in plain
+// text and exited normally, same as any other finished turn. So this is a
+// convention WE define via the prompt (see AGENT_PROMPT_SUFFIX) and parse out
+// of whatever plain text a turn ends with, uniformly across all three tools.
+function parseOptionsMarker(text) {
+  const m = text.match(/OPTIONS:\s*(\[[\s\S]*\])\s*$/);
+  if (!m) return null;
+  try {
+    const options = JSON.parse(m[1]);
+    if (!Array.isArray(options) || options.length === 0) return null;
+    return { text: text.slice(0, m.index).trim() || "Choose an option:", options };
+  } catch {
+    return null;
+  }
+}
 
-// Verified against a real successful run (file write + read-back).
+// Each summarizer takes one parsed JSONL event from a tool's structured
+// output mode and returns either an array of structured {kind, text, ...}
+// events (kind: "tool_call" | "message" | "question" | "error" | "done") or
+// null to skip it entirely. No raw code/diffs/tool payloads — those stay in
+// the separate "diff" message sent at approval time. Built from real event
+// streams captured against actual installs on this machine — not guessed —
+// except where noted.
+
+// Verified against a real successful run (file write + read-back) and a real
+// question-asking run (see parseOptionsMarker comment above).
 function summarizeClaudeEvent(ev) {
   if (ev.type === "assistant" && ev.message?.content) {
-    const lines = [];
+    const items = [];
     for (const block of ev.message.content) {
       if (block.type === "tool_use") {
         const target = block.input?.file_path || block.input?.command || block.input?.pattern || "";
-        lines.push(`• ${block.name}${target ? `: ${truncate(target)}` : ""}`);
+        items.push({
+          kind: "tool_call",
+          tool: block.name,
+          ...(target ? { target: truncate(target) } : {}),
+          text: `${block.name}${target ? `: ${truncate(target)}` : ""}`,
+        });
       } else if (block.type === "text" && block.text?.trim()) {
-        lines.push(`• ${truncate(block.text, 200)}`);
+        const parsed = parseOptionsMarker(block.text);
+        items.push(
+          parsed
+            ? { kind: "question", text: parsed.text, options: parsed.options }
+            : { kind: "message", text: truncate(block.text, 200) }
+        );
       }
     }
-    return lines.length ? lines.join("\n") : null;
+    return items.length ? items : null;
   }
   if (ev.type === "user" && ev.message?.content) {
     for (const block of ev.message.content) {
       if (block.type === "tool_result" && block.is_error) {
         const text = typeof block.content === "string" ? block.content : JSON.stringify(block.content);
-        return `⚠ Error: ${truncate(text, 200)}`;
+        return [{ kind: "error", text: truncate(text, 200) }];
       }
     }
     return null;
   }
   if (ev.type === "result") {
-    return ev.is_error ? `✗ Failed: ${truncate(ev.result || "unknown error", 200)}` : "✓ Done";
+    return ev.is_error
+      ? [{ kind: "error", text: truncate(ev.result || "unknown error", 200) }]
+      : [{ kind: "done", text: "Done" }];
   }
   return null;
 }
@@ -142,19 +182,33 @@ function summarizeCopilotEvent(ev) {
   if (ev.type === "tool.execution_start") {
     const a = ev.data?.arguments || {};
     const target = a.path || a.command || a.query || "";
-    return `• ${ev.data?.toolName}${target ? `: ${truncate(target)}` : ""}`;
+    return [
+      {
+        kind: "tool_call",
+        tool: ev.data?.toolName,
+        ...(target ? { target: truncate(target) } : {}),
+        text: `${ev.data?.toolName}${target ? `: ${truncate(target)}` : ""}`,
+      },
+    ];
   }
   if (ev.type === "tool.execution_complete") {
     if (ev.data?.success === false) {
-      return `⚠ Error: ${truncate(ev.data?.result?.content || "tool failed", 200)}`;
+      return [{ kind: "error", text: truncate(ev.data?.result?.content || "tool failed", 200) }];
     }
     return null; // tool_start already announced it; skip the (verbose) completion payload
   }
   if (ev.type === "assistant.message" && ev.data?.content?.trim()) {
-    return `• ${truncate(ev.data.content, 200)}`;
+    const parsed = parseOptionsMarker(ev.data.content);
+    return [
+      parsed
+        ? { kind: "question", text: parsed.text, options: parsed.options }
+        : { kind: "message", text: truncate(ev.data.content, 200) },
+    ];
   }
   if (ev.type === "result") {
-    return ev.exitCode === 0 ? "✓ Done" : `✗ Failed (exit ${ev.exitCode})`;
+    return ev.exitCode === 0
+      ? [{ kind: "done", text: "Done" }]
+      : [{ kind: "error", text: `Failed (exit ${ev.exitCode})` }];
   }
   return null;
 }
@@ -166,21 +220,44 @@ function summarizeCopilotEvent(ev) {
 // content, so an actual schema mismatch degrades safely instead of leaking
 // verbose output back through.
 function summarizeCodexEvent(ev) {
-  if (ev.type === "error") return `⚠ Error: ${truncate(ev.message, 200)}`;
+  if (ev.type === "error") return [{ kind: "error", text: truncate(ev.message, 200) }];
   if (ev.type === "turn.failed") {
-    return `✗ Failed: ${truncate(ev.error?.message || "unknown error", 200)}`;
+    return [{ kind: "error", text: truncate(ev.error?.message || "unknown error", 200) }];
   }
   if (ev.type === "item.completed" && ev.item) {
     const item = ev.item;
-    if (item.type === "error") return `⚠ Error: ${truncate(item.message, 200)}`;
-    if (item.type === "agent_message" && item.text) return `• ${truncate(item.text, 200)}`;
-    if (item.type === "command_execution" && item.command) {
-      return `• Running: ${truncate(item.command, 150)}`;
+    if (item.type === "error") return [{ kind: "error", text: truncate(item.message, 200) }];
+    if (item.type === "agent_message" && item.text) {
+      const parsed = parseOptionsMarker(item.text);
+      return [
+        parsed
+          ? { kind: "question", text: parsed.text, options: parsed.options }
+          : { kind: "message", text: truncate(item.text, 200) },
+      ];
     }
-    if (item.type === "file_change" && item.path) return `• Editing: ${truncate(item.path, 150)}`;
-    return `• ${item.type || "step"} completed`;
+    if (item.type === "command_execution" && item.command) {
+      return [
+        {
+          kind: "tool_call",
+          tool: "command_execution",
+          target: truncate(item.command, 150),
+          text: `Running: ${truncate(item.command, 150)}`,
+        },
+      ];
+    }
+    if (item.type === "file_change" && item.path) {
+      return [
+        {
+          kind: "tool_call",
+          tool: "file_change",
+          target: truncate(item.path, 150),
+          text: `Editing: ${truncate(item.path, 150)}`,
+        },
+      ];
+    }
+    return [{ kind: "tool_call", tool: item.type || "step", text: `${item.type || "step"} completed` }];
   }
-  if (ev.type === "turn.completed" || ev.type === "thread.completed") return "✓ Done";
+  if (ev.type === "turn.completed" || ev.type === "thread.completed") return [{ kind: "done", text: "Done" }];
   return null;
 }
 
@@ -292,6 +369,17 @@ const PORT = Number(process.env.PORT || 8787);
 // session forever with no feedback. 10 minutes is generous for a real task
 // while still bounding a truly stuck process.
 const AGENT_TIMEOUT_MS = Number(process.env.AGENT_TIMEOUT_MS || 10 * 60 * 1000);
+
+// Appended to every prompt, including follow-ups after an answered question.
+// The OPTIONS convention is ours, not any tool's — see parseOptionsMarker.
+const AGENT_PROMPT_SUFFIX =
+  `\n\nMake the necessary code changes in this repo. Do NOT run 'git commit' or 'git push' ` +
+  `yourself — stop once the changes are made on disk.\n\n` +
+  `If you need the user to choose between a small number of options before proceeding, ` +
+  `don't guess — end your reply with exactly one line formatted:\n` +
+  `OPTIONS: ["Option A description", "Option B description", ...]\n` +
+  `Don't make any file changes yet if you're asking — wait for the user's choice.`;
+
 const ALLOWED_REPOS = (process.env.ALLOWED_REPOS || "")
   .split(",")
   .map((p) => p && path.resolve(p))
@@ -520,7 +608,153 @@ async function main() {
   }
 
   // Per-connection state: only one pending change-set at a time.
-  let pending = null; // { repo, agentProc }
+  let pending = null; // { repo, agentProc, awaitingAnswer }
+
+  // Shared by "instruction" (fresh prompt) and "answer" (follow-up prompt
+  // after a question) — both just start an agent turn against the same repo
+  // and wire up the same output/timeout/completion handling.
+  function runAgentTurn(repo, prompt, ws) {
+    broadcast(repo, { type: "status", state: "running" }, ws);
+
+    const agentProc = spawn(SELECTED_AGENT.cmd, SELECTED_AGENT.buildArgs(prompt), { cwd: repo });
+    pending = { repo, agentProc, awaitingAnswer: false };
+
+    // A client can answer a question as soon as it sees the "question" log
+    // event — which happens while this process is still winding down, not
+    // necessarily after it has actually exited. That starts a NEW agentProc
+    // and reassigns `pending` before this one is done flushing output or
+    // has fired "close". Verified this race directly with a fast-answering
+    // test client: this process's trailing output and its close handler
+    // both fired after the new turn had already started, corrupting its
+    // state and leaking a stale "done" through right after "running".
+    // Every use of shared `pending` state below must check this first.
+    const owns = () => pending?.agentProc === agentProc;
+
+    let timedOut = false;
+    const timeoutTimer = setTimeout(() => {
+      timedOut = true;
+      agentProc.kill();
+      broadcast(
+        repo,
+        {
+          type: "error",
+          message: `${SELECTED_AGENT.label} timed out after ${Math.round(
+            AGENT_TIMEOUT_MS / 1000
+          )}s with no result — it may be stuck on an interactive prompt (e.g. a first-run login)`,
+        },
+        ws
+      );
+      if (owns()) pending = null;
+      broadcast(repo, { type: "status", state: "idle" }, ws);
+    }, AGENT_TIMEOUT_MS);
+
+    // Known tools emit structured JSONL; turn it into concise structured
+    // events rather than forwarding raw text. Custom AGENT_CMD overrides
+    // have no known schema, so they fall back to raw passthrough
+    // (SUMMARIZERS lookup misses, summarize stays undefined).
+    const summarize = SUMMARIZERS[SELECTED_AGENT.label];
+    let lineBuffer = "";
+
+    function handleOutput(d) {
+      if (!owns()) return; // superseded by a newer turn — drop trailing output
+      if (!summarize) {
+        broadcast(repo, { type: "log", kind: "raw", text: d.toString() }, ws);
+        return;
+      }
+      lineBuffer += d.toString();
+      let idx;
+      while ((idx = lineBuffer.indexOf("\n")) !== -1) {
+        const line = lineBuffer.slice(0, idx).trim();
+        lineBuffer = lineBuffer.slice(idx + 1);
+        if (!line) continue;
+        if (!owns()) return; // could have been superseded mid-loop too
+        let ev;
+        try {
+          ev = JSON.parse(line);
+        } catch {
+          // Not JSON — e.g. a stray CLI warning outside the structured
+          // stream. Surface it raw rather than risk silently dropping a
+          // real error just because it didn't fit the expected schema.
+          broadcast(repo, { type: "log", kind: "raw", text: line }, ws);
+          continue;
+        }
+        const items = summarize(ev);
+        if (!items) continue;
+        for (const item of items) {
+          if (item.kind === "question") pending.awaitingAnswer = true;
+          // A tool's own "done" fires right after it answers a question too
+          // (it doesn't know about our OPTIONS convention) — suppress it so
+          // the phone doesn't see "done" immediately after "please choose."
+          if (item.kind === "done" && pending.awaitingAnswer) continue;
+          broadcast(repo, { type: "log", ...item }, ws);
+        }
+      }
+    }
+
+    agentProc.stdout.on("data", handleOutput);
+    agentProc.stderr.on("data", handleOutput);
+    let spawnFailed = false;
+
+    agentProc.on("error", (e) => {
+      clearTimeout(timeoutTimer);
+      if (timedOut) return;
+      spawnFailed = true;
+      broadcast(
+        repo,
+        { type: "error", message: `failed to start ${SELECTED_AGENT.label}: ${e.message}` },
+        ws
+      );
+      if (owns()) pending = null;
+      broadcast(repo, { type: "status", state: "idle" }, ws);
+    });
+
+    agentProc.on("close", async (code) => {
+      clearTimeout(timeoutTimer);
+      if (spawnFailed || timedOut) return;
+      if (code !== 0) {
+        broadcast(
+          repo,
+          { type: "error", message: `${SELECTED_AGENT.label} exited with code ${code}` },
+          ws
+        );
+        if (owns()) pending = null;
+        broadcast(repo, { type: "status", state: "idle" }, ws);
+        return;
+      }
+
+      if (!owns()) {
+        // A newer turn already took over (see comment above) — this one's
+        // outcome is moot, and touching `pending`/status now would corrupt
+        // whatever the newer turn is doing.
+        return;
+      }
+
+      if (pending.awaitingAnswer) {
+        // Not finished — genuinely paused. Keep `pending` so an "answer"
+        // message can resume this same turn via --continue.
+        broadcast(repo, { type: "status", state: "awaiting_answer" }, ws);
+        return;
+      }
+
+      try {
+        const clean = await isTreeClean(repo);
+        if (clean) {
+          broadcast(repo, { type: "status", state: "no_changes" }, ws);
+          pending = null;
+          return;
+        }
+
+        await runGit(repo, ["add", "-A"]);
+        const diff = await runGit(repo, ["diff", "--cached"]);
+        broadcast(repo, { type: "diff", diff }, ws);
+        broadcast(repo, { type: "status", state: "awaiting_approval" }, ws);
+      } catch (e) {
+        broadcast(repo, { type: "error", message: `post-run git failed: ${e.message}` }, ws);
+        pending = null;
+        broadcast(repo, { type: "status", state: "idle" }, ws);
+      }
+    });
+  }
 
   ws.on("message", async (raw) => {
     let msg;
@@ -570,123 +804,27 @@ async function main() {
         return;
       }
 
-      broadcast(repo, { type: "status", state: "running" }, ws);
+      runAgentTurn(repo, `${msg.text}${AGENT_PROMPT_SUFFIX}`, ws);
+      return;
+    }
 
-      const prompt =
-        `${msg.text}\n\n` +
-        `Make the necessary code changes in this repo. Do NOT run 'git commit' or 'git push' ` +
-        `yourself — stop once the changes are made on disk.`;
-
-      const agentProc = spawn(SELECTED_AGENT.cmd, SELECTED_AGENT.buildArgs(prompt), {
-        cwd: repo,
-      });
-      pending = { repo, agentProc };
-
-      let timedOut = false;
-      const timeoutTimer = setTimeout(() => {
-        timedOut = true;
-        agentProc.kill();
-        broadcast(
-          repo,
-          {
-            type: "error",
-            message: `${SELECTED_AGENT.label} timed out after ${Math.round(
-              AGENT_TIMEOUT_MS / 1000
-            )}s with no result — it may be stuck on an interactive prompt (e.g. a first-run login)`,
-          },
-          ws
-        );
-        pending = null;
-        broadcast(repo, { type: "status", state: "idle" }, ws);
-      }, AGENT_TIMEOUT_MS);
-
-      // Known tools emit structured JSONL; turn it into concise lines rather
-      // than forwarding raw text. Custom AGENT_CMD overrides have no known
-      // schema, so they fall back to raw passthrough (SUMMARIZERS lookup
-      // misses, summarize stays undefined).
-      const summarize = SUMMARIZERS[SELECTED_AGENT.label];
-      let lineBuffer = "";
-
-      function handleOutput(d) {
-        if (!summarize) {
-          broadcast(repo, { type: "log", chunk: d.toString() }, ws);
-          return;
-        }
-        lineBuffer += d.toString();
-        let idx;
-        while ((idx = lineBuffer.indexOf("\n")) !== -1) {
-          const line = lineBuffer.slice(0, idx).trim();
-          lineBuffer = lineBuffer.slice(idx + 1);
-          if (!line) continue;
-          let ev;
-          try {
-            ev = JSON.parse(line);
-          } catch {
-            // Not JSON — e.g. a stray CLI warning outside the structured
-            // stream. Surface it raw rather than risk silently dropping a
-            // real error just because it didn't fit the expected schema.
-            broadcast(repo, { type: "log", chunk: line + "\n" }, ws);
-            continue;
-          }
-          const summary = summarize(ev);
-          if (summary) broadcast(repo, { type: "log", chunk: summary + "\n" }, ws);
-        }
+    if (msg.type === "answer") {
+      if (!pending || !pending.awaitingAnswer) {
+        send(ws, { type: "error", message: "nothing awaiting an answer" });
+        return;
       }
-
-      agentProc.stdout.on("data", handleOutput);
-      agentProc.stderr.on("data", handleOutput);
-      let spawnFailed = false;
-      agentProc.on("error", (e) => {
-        clearTimeout(timeoutTimer);
-        if (timedOut) return;
-        spawnFailed = true;
-        broadcast(
-          repo,
-          { type: "error", message: `failed to start ${SELECTED_AGENT.label}: ${e.message}` },
-          ws
-        );
-        pending = null;
-        broadcast(repo, { type: "status", state: "idle" }, ws);
-      });
-
-      agentProc.on("close", async (code) => {
-        clearTimeout(timeoutTimer);
-        if (spawnFailed || timedOut) return;
-        if (code !== 0) {
-          broadcast(
-            repo,
-            { type: "error", message: `${SELECTED_AGENT.label} exited with code ${code}` },
-            ws
-          );
-          pending = null;
-          broadcast(repo, { type: "status", state: "idle" }, ws);
-          return;
-        }
-
-        try {
-          const clean = await isTreeClean(repo);
-          if (clean) {
-            broadcast(repo, { type: "status", state: "no_changes" }, ws);
-            pending = null;
-            return;
-          }
-
-          await runGit(repo, ["add", "-A"]);
-          const diff = await runGit(repo, ["diff", "--cached"]);
-          broadcast(repo, { type: "diff", diff }, ws);
-          broadcast(repo, { type: "status", state: "awaiting_approval" }, ws);
-        } catch (e) {
-          broadcast(repo, { type: "error", message: `post-run git failed: ${e.message}` }, ws);
-          pending = null;
-          broadcast(repo, { type: "status", state: "idle" }, ws);
-        }
-      });
+      const { repo } = pending;
+      runAgentTurn(repo, `The user chose: "${msg.value}". Proceed accordingly.${AGENT_PROMPT_SUFFIX}`, ws);
       return;
     }
 
     if (msg.type === "approve") {
       if (!pending) {
         send(ws, { type: "error", message: "nothing pending" });
+        return;
+      }
+      if (pending.awaitingAnswer) {
+        send(ws, { type: "error", message: "an answer is required before this can be approved" });
         return;
       }
       const { repo } = pending;
@@ -729,6 +867,16 @@ async function main() {
     if (msg.type === "reject") {
       if (!pending) {
         send(ws, { type: "error", message: "nothing pending" });
+        return;
+      }
+      if (pending.awaitingAnswer) {
+        // No diff exists yet to discard — treat this as cancelling the
+        // pending question instead, since there's otherwise no way to back
+        // out of an unwanted question flow.
+        const awaitingRepo = pending.repo;
+        pending = null;
+        broadcast(awaitingRepo, { type: "result", ok: true, detail: "cancelled" }, ws);
+        broadcast(awaitingRepo, { type: "status", state: "idle" }, ws);
         return;
       }
       const { repo } = pending;
