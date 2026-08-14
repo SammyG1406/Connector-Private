@@ -96,25 +96,136 @@ function checkCommandAvailable(cmd, args) {
   });
 }
 
+function truncate(s, n = 150) {
+  s = String(s).replace(/\s+/g, " ").trim();
+  return s.length > n ? s.slice(0, n - 1) + "…" : s;
+}
+
+// Each summarizer takes one parsed JSONL event from a tool's structured
+// output mode and returns either a short human-readable line (a bullet
+// point, no raw code/diffs) or null to skip it entirely. Built from real
+// event streams captured against actual installs on this machine — not
+// guessed — except where noted.
+
+// Verified against a real successful run (file write + read-back).
+function summarizeClaudeEvent(ev) {
+  if (ev.type === "assistant" && ev.message?.content) {
+    const lines = [];
+    for (const block of ev.message.content) {
+      if (block.type === "tool_use") {
+        const target = block.input?.file_path || block.input?.command || block.input?.pattern || "";
+        lines.push(`• ${block.name}${target ? `: ${truncate(target)}` : ""}`);
+      } else if (block.type === "text" && block.text?.trim()) {
+        lines.push(`• ${truncate(block.text, 200)}`);
+      }
+    }
+    return lines.length ? lines.join("\n") : null;
+  }
+  if (ev.type === "user" && ev.message?.content) {
+    for (const block of ev.message.content) {
+      if (block.type === "tool_result" && block.is_error) {
+        const text = typeof block.content === "string" ? block.content : JSON.stringify(block.content);
+        return `⚠ Error: ${truncate(text, 200)}`;
+      }
+    }
+    return null;
+  }
+  if (ev.type === "result") {
+    return ev.is_error ? `✗ Failed: ${truncate(ev.result || "unknown error", 200)}` : "✓ Done";
+  }
+  return null;
+}
+
+// Verified against a real successful run (file write + read-back).
+function summarizeCopilotEvent(ev) {
+  if (ev.ephemeral === true) return null;
+  if (ev.type === "tool.execution_start") {
+    const a = ev.data?.arguments || {};
+    const target = a.path || a.command || a.query || "";
+    return `• ${ev.data?.toolName}${target ? `: ${truncate(target)}` : ""}`;
+  }
+  if (ev.type === "tool.execution_complete") {
+    if (ev.data?.success === false) {
+      return `⚠ Error: ${truncate(ev.data?.result?.content || "tool failed", 200)}`;
+    }
+    return null; // tool_start already announced it; skip the (verbose) completion payload
+  }
+  if (ev.type === "assistant.message" && ev.data?.content?.trim()) {
+    return `• ${truncate(ev.data.content, 200)}`;
+  }
+  if (ev.type === "result") {
+    return ev.exitCode === 0 ? "✓ Done" : `✗ Failed (exit ${ev.exitCode})`;
+  }
+  return null;
+}
+
+// Best-effort: only the error path (item.completed type:"error", turn.failed)
+// was verified against a real run — no OpenAI-authenticated account was
+// available on this machine to exercise the success path. Unrecognized
+// item types fall back to a generic short line rather than dumping raw
+// content, so an actual schema mismatch degrades safely instead of leaking
+// verbose output back through.
+function summarizeCodexEvent(ev) {
+  if (ev.type === "error") return `⚠ Error: ${truncate(ev.message, 200)}`;
+  if (ev.type === "turn.failed") {
+    return `✗ Failed: ${truncate(ev.error?.message || "unknown error", 200)}`;
+  }
+  if (ev.type === "item.completed" && ev.item) {
+    const item = ev.item;
+    if (item.type === "error") return `⚠ Error: ${truncate(item.message, 200)}`;
+    if (item.type === "agent_message" && item.text) return `• ${truncate(item.text, 200)}`;
+    if (item.type === "command_execution" && item.command) {
+      return `• Running: ${truncate(item.command, 150)}`;
+    }
+    if (item.type === "file_change" && item.path) return `• Editing: ${truncate(item.path, 150)}`;
+    return `• ${item.type || "step"} completed`;
+  }
+  if (ev.type === "turn.completed" || ev.type === "thread.completed") return "✓ Done";
+  return null;
+}
+
+const SUMMARIZERS = {
+  claude: summarizeClaudeEvent,
+  copilot: summarizeCopilotEvent,
+  codex: summarizeCodexEvent,
+};
+
 // Known agent CLIs, tried in priority order (AGENT_PRIORITY) at startup —
 // first one that's actually installed wins. Each buildArgs(prompt) returns
-// the args for a fresh, non-interactive, no-confirmation-prompts run.
-// Flags verified directly against each tool's --help, not guessed.
+// the args for a fresh, non-interactive, no-confirmation-prompts run, using
+// each tool's structured JSONL output mode so summarizeXEvent() above can
+// turn it into concise lines instead of forwarding raw text. Flags verified
+// directly against each tool's --help, not guessed.
 const KNOWN_AGENTS = {
   claude: {
     cmd: "claude",
     versionArgs: ["--version"],
-    buildArgs: (prompt) => ["-p", prompt, "--dangerously-skip-permissions", "--continue"],
+    buildArgs: (prompt) => [
+      "-p",
+      prompt,
+      "--dangerously-skip-permissions",
+      "--continue",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+    ],
   },
   copilot: {
     cmd: "copilot",
     versionArgs: ["--version"],
-    buildArgs: (prompt) => ["-p", prompt, "--allow-all-tools", "--continue"],
+    buildArgs: (prompt) => [
+      "-p",
+      prompt,
+      "--allow-all-tools",
+      "--continue",
+      "--output-format",
+      "json",
+    ],
   },
   codex: {
     cmd: "codex",
     versionArgs: ["--version"],
-    buildArgs: (prompt) => ["exec", prompt, "--dangerously-bypass-approvals-and-sandbox"],
+    buildArgs: (prompt) => ["exec", prompt, "--dangerously-bypass-approvals-and-sandbox", "--json"],
   },
 };
 
@@ -437,12 +548,41 @@ async function main() {
         broadcast(repo, { type: "status", state: "idle" }, ws);
       }, AGENT_TIMEOUT_MS);
 
-      agentProc.stdout.on("data", (d) => {
-        broadcast(repo, { type: "log", chunk: d.toString() }, ws);
-      });
-      agentProc.stderr.on("data", (d) => {
-        broadcast(repo, { type: "log", chunk: d.toString() }, ws);
-      });
+      // Known tools emit structured JSONL; turn it into concise lines rather
+      // than forwarding raw text. Custom AGENT_CMD overrides have no known
+      // schema, so they fall back to raw passthrough (SUMMARIZERS lookup
+      // misses, summarize stays undefined).
+      const summarize = SUMMARIZERS[SELECTED_AGENT.label];
+      let lineBuffer = "";
+
+      function handleOutput(d) {
+        if (!summarize) {
+          broadcast(repo, { type: "log", chunk: d.toString() }, ws);
+          return;
+        }
+        lineBuffer += d.toString();
+        let idx;
+        while ((idx = lineBuffer.indexOf("\n")) !== -1) {
+          const line = lineBuffer.slice(0, idx).trim();
+          lineBuffer = lineBuffer.slice(idx + 1);
+          if (!line) continue;
+          let ev;
+          try {
+            ev = JSON.parse(line);
+          } catch {
+            // Not JSON — e.g. a stray CLI warning outside the structured
+            // stream. Surface it raw rather than risk silently dropping a
+            // real error just because it didn't fit the expected schema.
+            broadcast(repo, { type: "log", chunk: line + "\n" }, ws);
+            continue;
+          }
+          const summary = summarize(ev);
+          if (summary) broadcast(repo, { type: "log", chunk: summary + "\n" }, ws);
+        }
+      }
+
+      agentProc.stdout.on("data", handleOutput);
+      agentProc.stderr.on("data", handleOutput);
       let spawnFailed = false;
       agentProc.on("error", (e) => {
         clearTimeout(timeoutTimer);
