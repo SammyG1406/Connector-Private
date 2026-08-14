@@ -1,0 +1,40 @@
+Connector-Private — Code Structure
+===================================
+
+Root
+----
+bridge.js
+  WebSocket server that receives instructions from the phone app, runs
+  a Claude Code process against a target repo, and streams back logs,
+  diffs, and status. Handles approve/reject: approve commits + pushes,
+  reject runs `git reset --hard` + `git clean -fd` to discard changes.
+
+tunnel.js / devtunnel-util.js
+  Set up and manage the dev tunnel (devtunnel) that exposes bridge.js
+  to the phone app over the internet.
+
+qr.js
+  Generates a QR code (and JSON payload) encoding the tunnel's
+  WebSocket URL and repo path, for pairing the phone app.
+
+package.json / package-lock.json
+  Root Node project. Scripts: "bridge" (node bridge.js), "tunnel"
+  (node tunnel.js), "qr" (node qr.js), "dev" (runs bridge + tunnel
+  concurrently).
+
+.env
+  Local config: PORT, NGROK/devtunnel settings, AUTH_TOKEN,
+  ALLOWED_REPOS.
+
+.vscode/launch.json
+  VS Code debug configuration.
+
+vscode-extension/
+------------------
+extension.js
+  VS Code extension entry point. Adds commands to start/stop the
+  bridge (runs `npm run dev` in a terminal) and show the pairing QR
+  code (runs `node qr.js --json`).
+
+package.json
+  Extension manifest (commands, activation events, configuration).
