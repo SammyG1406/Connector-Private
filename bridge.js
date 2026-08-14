@@ -433,7 +433,59 @@ function broadcast(repo, msg, originWs) {
   }
 }
 
+// Windows idle-sleep would suspend the bridge, the tunnel, and any in-flight
+// agent process without warning, and severs every open connection. Rather
+// than requiring a machine-wide "never sleep" power setting, hold Windows'
+// own SetThreadExecutionState(ES_SYSTEM_REQUIRED) for exactly as long as the
+// bridge is running — via a small PowerShell helper, since that avoids any
+// native Node addon/compilation step. This only suppresses idle-timeout
+// sleep; it does NOT override an explicit lid-close or manual sleep action
+// (those are separate Windows power settings). Opt out with PREVENT_SLEEP=false.
+let keepAwakeProc = null;
+
+function startKeepAwake() {
+  if (process.platform !== "win32") return;
+  if (process.env.PREVENT_SLEEP === "false") return;
+  keepAwakeProc = spawn(
+    "powershell",
+    [
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      path.join(__dirname, "keep-awake.ps1"),
+      "-ParentPid",
+      String(process.pid),
+    ],
+    { windowsHide: true }
+  );
+  keepAwakeProc.on("error", (e) => {
+    console.error(`[keep-awake] failed to start: ${e.message}`);
+    keepAwakeProc = null;
+  });
+  keepAwakeProc.stdout.on("data", (d) => console.log(`[keep-awake] ${d.toString().trim()}`));
+  keepAwakeProc.stderr.on("data", (d) => console.error(`[keep-awake] ${d.toString().trim()}`));
+}
+
+function stopKeepAwake() {
+  if (keepAwakeProc) {
+    keepAwakeProc.kill();
+    keepAwakeProc = null;
+  }
+}
+
+process.on("exit", stopKeepAwake);
+process.on("SIGINT", () => {
+  stopKeepAwake();
+  process.exit(0);
+});
+process.on("SIGTERM", () => {
+  stopKeepAwake();
+  process.exit(0);
+});
+
 async function main() {
+  startKeepAwake();
   await selectAgent();
 
   const wss = new WebSocketServer({ port: PORT });
