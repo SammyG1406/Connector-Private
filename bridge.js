@@ -783,19 +783,6 @@ async function main() {
         return;
       }
 
-      try {
-        if (!(await isTreeClean(repo))) {
-          send(ws, {
-            type: "error",
-            message: "working tree is not clean; commit or stash your changes first",
-          });
-          return;
-        }
-      } catch (e) {
-        send(ws, { type: "error", message: `git status failed: ${e.message}` });
-        return;
-      }
-
       if (!SELECTED_AGENT) {
         send(ws, {
           type: "error",
