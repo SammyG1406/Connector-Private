@@ -3,6 +3,11 @@
 # dependencies
 /node_modules
 food-service/node_modules
+vscode-extension/node_modules
+
+# vscode extension build output
+vscode-extension/dist
+*.vsix
 /.pnp
 .pnp.js
 

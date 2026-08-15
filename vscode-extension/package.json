@@ -2,14 +2,50 @@
   "name": "connector-bridge-control",
   "displayName": "Connector Bridge Control",
   "description": "One-click start/stop and QR pairing for the phone-to-repo bridge",
-  "version": "0.0.1",
+  "version": "0.1.0",
+  "publisher": "SamarthG14",
+  "license": "ISC",
+  "icon": "icon.png",
   "engines": {
     "vscode": "^1.85.0"
   },
   "categories": ["Other"],
+  "keywords": ["bridge", "remote", "mobile", "git", "github", "claude", "copilot", "codex"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SammyG1406/Connector-Private.git",
+    "directory": "vscode-extension"
+  },
+  "bugs": {
+    "url": "https://github.com/SammyG1406/Connector-Private/issues"
+  },
+  "homepage": "https://github.com/SammyG1406/Connector-Private#readme",
   "activationEvents": ["onStartupFinished"],
-  "main": "./extension.js",
+  "main": "./dist/extension.js",
+  "scripts": {
+    "build": "node esbuild.js",
+    "vscode:prepublish": "npm run build",
+    "package": "npm run build && vsce package"
+  },
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "connectorBridge",
+          "title": "Connector Bridge",
+          "icon": "media/activity-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "connectorBridge": [
+        {
+          "type": "webview",
+          "id": "connectorBridge.panel",
+          "name": "Bridge"
+        }
+      ]
+    },
     "commands": [
       {
         "command": "connectorBridge.start",
@@ -22,17 +58,78 @@
       {
         "command": "connectorBridge.showQR",
         "title": "Connector Bridge: Show QR Code"
+      },
+      {
+        "command": "connectorBridge.toggle",
+        "title": "Connector Bridge: Start/Stop",
+        "icon": {
+          "light": "media/icon-light.svg",
+          "dark": "media/icon-dark.svg"
+        }
       }
     ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "connectorBridge.toggle",
+          "group": "navigation"
+        }
+      ]
+    },
     "configuration": {
       "title": "Connector Bridge",
       "properties": {
-        "connectorBridge.projectPath": {
+        "connectorBridge.port": {
+          "type": "number",
+          "default": 8787,
+          "description": "Local port the bridge's WebSocket server listens on."
+        },
+        "connectorBridge.tunnelId": {
+          "type": "string",
+          "default": "connector-bridge",
+          "description": "devtunnel tunnel ID used to expose the bridge to the phone app."
+        },
+        "connectorBridge.additionalRepos": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Extra absolute repo paths to allow instructions against, beyond the currently open workspace folder(s)."
+        },
+        "connectorBridge.agentCommand": {
           "type": "string",
           "default": "",
-          "description": "Absolute path to the bridge project (the folder containing bridge.js). Defaults to the first workspace folder if unset."
+          "description": "Override which agent CLI runs instructions (default: auto-detect claude, copilot, or codex, in that order)."
+        },
+        "connectorBridge.agentArgs": {
+          "type": "string",
+          "default": "",
+          "description": "Argument template for connectorBridge.agentCommand, using {prompt} as a placeholder. Only used when agentCommand is set."
+        },
+        "connectorBridge.agentPriority": {
+          "type": "string",
+          "default": "claude,copilot,codex",
+          "description": "Comma-separated order to try known agent CLIs in, when agentCommand is not set."
+        },
+        "connectorBridge.agentTimeoutSeconds": {
+          "type": "number",
+          "default": 600,
+          "description": "How long to wait for an agent turn before treating it as stuck."
+        },
+        "connectorBridge.preventSleep": {
+          "type": "boolean",
+          "default": true,
+          "description": "Prevent Windows idle sleep while the bridge is running, so open connections aren't dropped."
         }
       }
     }
+  },
+  "dependencies": {
+    "cross-spawn": "^7.0.6",
+    "qrcode": "^1.5.4",
+    "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "^3.2.1",
+    "esbuild": "^0.24.2"
   }
 }

@@ -1,0 +1,12 @@
+.vscode/**
+node_modules/**
+esbuild.js
+extension.js
+dist/**/*.map
+.gitignore
+**/*.ts
+**/tsconfig.json
+*.jpg
+*.jpeg
+Connector Circular Network Logo*.png
+Final Logo.png
