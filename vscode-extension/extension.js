@@ -1,5 +1,6 @@
 const vscode = require("vscode");
 const path = require("path");
+const fs = require("fs");
 const { startBridgeServer } = require("../bridge-core");
 const { startTunnelHost } = require("../tunnel-core");
 const { generateQR } = require("../qr-core");
@@ -16,6 +17,46 @@ function getAllowedRepos() {
   const folders = (vscode.workspace.workspaceFolders || []).map((f) => f.uri.fsPath);
   const all = [...folders, ...additional].filter(Boolean).map((p) => path.resolve(p));
   return [...new Set(all)];
+}
+
+function isGitRepo(dir) {
+  try {
+    return fs.existsSync(path.join(dir, ".git"));
+  } catch {
+    return false;
+  }
+}
+
+// Looks one directory down for a git repo, so we can point the user at it
+// instead of silently starting the bridge against a non-repo folder.
+function findGitRepoOneLevelDown(dir) {
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  return entries
+    .filter((e) => e.isDirectory())
+    .map((e) => path.join(dir, e.name))
+    .filter(isGitRepo);
+}
+
+/**
+ * Checks each allowed repo path is actually a git repo. Returns
+ * { ok: string[], problems: { folder: string, suggestions: string[] }[] }.
+ */
+function validateAllowedRepos(allowedRepos) {
+  const ok = [];
+  const problems = [];
+  for (const repo of allowedRepos) {
+    if (isGitRepo(repo)) {
+      ok.push(repo);
+    } else {
+      problems.push({ folder: repo, suggestions: findGitRepoOneLevelDown(repo) });
+    }
+  }
+  return { ok, problems };
 }
 
 function updateStatusBar(state) {
@@ -163,12 +204,30 @@ function activate(context) {
       return;
     }
 
-    const allowedRepos = getAllowedRepos();
-    if (allowedRepos.length === 0) {
+    const requestedRepos = getAllowedRepos();
+    if (requestedRepos.length === 0) {
       vscode.window.showErrorMessage(
         "No folder open to use as the bridge target. Open a repo, or set connectorBridge.additionalRepos in settings."
       );
       return;
+    }
+
+    const { ok: allowedRepos, problems } = validateAllowedRepos(requestedRepos);
+    if (problems.length > 0) {
+      for (const { folder, suggestions } of problems) {
+        if (suggestions.length > 0) {
+          const message = `"${folder}" is not a git repository. Found ${
+            suggestions.length > 1 ? "git repos" : "a git repo"
+          } one level down: ${suggestions.join(", ")}. Open that folder directly in VS Code (File > Open Folder), then start the bridge again.`;
+          outputChannel.appendLine(`[bridge] ${message}`);
+          vscode.window.showErrorMessage(message);
+        } else {
+          const message = `"${folder}" is not a git repository, and none was found in its subfolders. Open the folder containing your git repo, then start the bridge again.`;
+          outputChannel.appendLine(`[bridge] ${message}`);
+          vscode.window.showErrorMessage(message);
+        }
+      }
+      if (allowedRepos.length === 0) return;
     }
 
     const cfg = vscode.workspace.getConfiguration("connectorBridge");
@@ -240,7 +299,7 @@ function activate(context) {
   });
 
   const showQR = vscode.commands.registerCommand("connectorBridge.showQR", async () => {
-    const allowedRepos = getAllowedRepos();
+    const { ok: allowedRepos } = validateAllowedRepos(getAllowedRepos());
     if (allowedRepos.length === 0) {
       vscode.window.showErrorMessage("No folder open to pair. Open a repo first.");
       return;
