@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.1
+
+- Updated the Marketplace description to actually mention the Connector app.
+
 ## 0.1.0
 
 - The bridge server, devtunnel hosting, and QR pairing now run in-process inside the extension — no separate `npm run dev` terminal, and no dependency on the extension's workspace being a checkout of this repo.

@@ -1,8 +1,8 @@
 {
   "name": "connector-bridge-control",
   "displayName": "Connector Bridge Control",
-  "description": "One-click start/stop and QR pairing for the phone-to-repo bridge",
-  "version": "0.1.0",
+  "description": "Pairs VS Code with the Connector mobile app: start the bridge, scan a QR code, and approve or reject AI-generated code changes from your phone.",
+  "version": "0.1.1",
   "publisher": "SamarthG14",
   "license": "ISC",
   "icon": "icon.png",
