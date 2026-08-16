@@ -844,7 +844,10 @@ function startBridgeServer(config, handlers = {}) {
             try {
               await runGit(repo, ["commit", "-m", msg.message || "Changes via bridge"]);
               try {
-                await runGit(repo, ["push"]);
+                // -u origin HEAD sets the upstream if this branch doesn't have
+                // one yet (e.g. a new branch the agent just created) and is a
+                // harmless no-op on subsequent pushes once it's tracked.
+                await runGit(repo, ["push", "-u", "origin", "HEAD"]);
                 broadcast(repo, { type: "result", ok: true, detail: "committed and pushed" }, ws);
               } catch (pushErr) {
                 broadcast(
