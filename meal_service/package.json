@@ -1,0 +1,16 @@
+{
+  "name": "meal-service",
+  "version": "1.0.0",
+  "description": "Meal logging microservice: CRUD for a user's logged meals",
+  "main": "index.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}
