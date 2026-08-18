@@ -1,0 +1,13 @@
+{
+  "name": "meals-service",
+  "version": "1.0.0",
+  "description": "Standalone REST API for CRUD operations on meals.",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}
