@@ -11,7 +11,7 @@ Turns the repo you have open in VS Code into a target the Connector phone app ca
 
 ## Requirements
 
-- The Connector mobile app installed on your phone — this is what you pair with by scanning the QR code.
+- The Connector Bridge Control mobile app installed on your phone — this is what you pair with by scanning the QR code. Download it on the Play Store (Android only).
 - The [devtunnel CLI](https://aka.ms/devtunnel) installed and on your PATH — used to expose the bridge publicly for pairing.
 - At least one agent CLI installed: [Claude Code](https://claude.com/claude-code), GitHub Copilot CLI, or Codex CLI. (Or point `connectorBridge.agentCommand` at something else.)
 - A workspace folder open that's a git repo with a GitHub `origin` remote.
