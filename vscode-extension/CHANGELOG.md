@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.2
+
+- Marketplace description and README now point to the Connector Bridge Control mobile app on the Play Store (Android only).
+
 ## 0.1.1
 
 - Updated the Marketplace description to actually mention the Connector app.

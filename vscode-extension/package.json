@@ -2,7 +2,7 @@
   "name": "connector-bridge-control",
   "displayName": "Connector Bridge Control",
   "description": "Pairs VS Code with the Connector Bridge Control mobile app: start the bridge, scan a QR code, and approve or reject AI-generated code changes from your phone. Download it on the Play Store (Android only).",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "publisher": "SamarthG14",
   "license": "ISC",
   "icon": "icon.png",
